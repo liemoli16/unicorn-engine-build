@@ -1,0 +1,36 @@
+name: Build Unicorn Engine
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  build-aarch64:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Unicorn Engine
+        uses: actions/checkout@v4
+        with:
+          repository: unicorn-engine/unicorn
+          submodules: true
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y cmake gcc g++ python3-dev ninja-build
+
+      - name: Configure CMake (aarch64-only)
+        run: |
+          cmake -B build -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DUNICORN_ARCHS=aarch64
+
+      - name: Build
+        run: cmake --build build --parallel $(nproc)
+
+      - name: Upload entire build directory
+        uses: actions/upload-artifact@v4
+        with:
+          name: unicorn-aarch64-build-dir
+          path: build/
