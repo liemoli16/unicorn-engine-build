@@ -19,7 +19,7 @@ jobs:
       - name: Set up Android NDK
         uses: nttld/setup-ndk@v1
         with:
-          ndk-version: r29c          # 或 r29
+          ndk-version: r29         # 或 r29
           local-cache: true
 
       - name: Configure CMake for Android aarch64
