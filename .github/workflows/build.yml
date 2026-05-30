@@ -1,7 +1,11 @@
 name: Build Android NDK r29 for aarch64 host
 
 on:
-  workflow_dispatch:   # 手动触发，你也可以改为 push 或 schedule
+  workflow_dispatch:   # 手动触发
+  push:
+    branches:
+      - main
+      - master
 
 env:
   NDK_VERSION: r29
@@ -25,14 +29,26 @@ jobs:
             ccache curl xz-utils
           echo "/usr/lib/ccache" >> $GITHUB_PATH
 
-      - name: Setup ccache
+      # -------------------- 2. 缓存设置 --------------------
+      - name: Cache ccache
         uses: actions/cache@v4
         with:
           path: ~/.cache/ccache
-          key: ${{ runner.os }}-ccache-llvm-${{ env.LLVM_VERSION }}-aarch64
+          key: ${{ runner.os }}-ccache-llvm-${{ env.LLVM_VERSION }}-aarch64-v2
+          restore-keys: |
+            ${{ runner.os }}-ccache-llvm-${{ env.LLVM_VERSION }}-aarch64-
+            ${{ runner.os }}-ccache-llvm-
 
-      # -------------------- 2. 获取官方 NDK（仅提取 sysroot 等） --------------------
+      - name: Cache official NDK
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: ndk-official
+          key: ndk-official-${{ env.NDK_VERSION }}-v1
+
+      # -------------------- 3. 获取官方 NDK（仅提取 sysroot 等） --------------------
       - name: Download official NDK r29 (x86_64)
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
         run: |
           curl -fSL -o ndk-official.zip \
             https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip
@@ -40,7 +56,11 @@ jobs:
           mv android-ndk-* ndk-official
           echo "NDK_OFFICIAL_PATH=$PWD/ndk-official" >> $GITHUB_ENV
 
-      # -------------------- 3. 获取 LLVM 源码 --------------------
+      - name: Set NDK path (cached)
+        if: steps.cache-ndk.outputs.cache-hit == 'true'
+        run: echo "NDK_OFFICIAL_PATH=$PWD/ndk-official" >> $GITHUB_ENV
+
+      # -------------------- 4. 获取 LLVM 源码 --------------------
       - name: Checkout LLVM project
         uses: actions/checkout@v4
         with:
@@ -49,7 +69,7 @@ jobs:
           path: llvm-project
           fetch-depth: 1
 
-      # -------------------- 4. 交叉编译 LLVM 工具链 --------------------
+      # -------------------- 5. 交叉编译 LLVM 工具链 --------------------
       - name: Configure CMake (cross-compile for aarch64 host)
         run: |
           mkdir -p llvm-build
@@ -83,7 +103,7 @@ jobs:
           cd llvm-build
           ninja install -j$(nproc)
 
-      # -------------------- 5. 组装 NDK 包 --------------------
+      # -------------------- 6. 组装 NDK 包 --------------------
       - name: Assemble aarch64 NDK
         run: |
           DEST="$RUNNER_TEMP/ndk-aarch64"
@@ -140,7 +160,7 @@ jobs:
 
           echo "NDK_AARCH64_DIR=$DEST" >> $GITHUB_ENV
 
-      # -------------------- 6. 打包并上传 artifact --------------------
+      # -------------------- 7. 打包并上传 artifact --------------------
       - name: Package NDK
         run: |
           cd "${{ runner.temp }}"
