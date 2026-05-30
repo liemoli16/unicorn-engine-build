@@ -1,48 +1,154 @@
-name: Build Unicorn for Android (aarch64, v2.1.4)
+name: Build Android NDK r29 for aarch64 host
 
 on:
-  workflow_dispatch:
-  push:
-    branches: [ main, master ]
+  workflow_dispatch:   # 手动触发，你也可以改为 push 或 schedule
+
+env:
+  NDK_VERSION: r29
+  LLVM_VERSION: 21.1.8
+  BUILD_TYPE: Release
 
 jobs:
-  build-android:
-    runs-on: ubuntu-latest
+  build:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+
     steps:
-      - name: Checkout Unicorn (v2.1.4)
+      # -------------------- 1. 环境准备 --------------------
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build python3 \
+            crossbuild-essential-arm64 \
+            ccache curl xz-utils
+          echo "/usr/lib/ccache" >> $GITHUB_PATH
+
+      - name: Setup ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ${{ runner.os }}-ccache-llvm-${{ env.LLVM_VERSION }}-aarch64
+
+      # -------------------- 2. 获取官方 NDK（仅提取 sysroot 等） --------------------
+      - name: Download official NDK r29 (x86_64)
+        run: |
+          curl -fSL -o ndk-official.zip \
+            https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip
+          unzip -q ndk-official.zip
+          mv android-ndk-* ndk-official
+          echo "NDK_OFFICIAL_PATH=$PWD/ndk-official" >> $GITHUB_ENV
+
+      # -------------------- 3. 获取 LLVM 源码 --------------------
+      - name: Checkout LLVM project
         uses: actions/checkout@v4
         with:
-          repository: unicorn-engine/unicorn
-          ref: '2.1.4'
-          submodules: true
+          repository: llvm/llvm-project
+          ref: llvmorg-${{ env.LLVM_VERSION }}
+          path: llvm-project
+          fetch-depth: 1
 
-      - name: Set up Android NDK
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r29         # 或 r29
-          local-cache: true
-
-      - name: Configure CMake for Android aarch64
+      # -------------------- 4. 交叉编译 LLVM 工具链 --------------------
+      - name: Configure CMake (cross-compile for aarch64 host)
         run: |
-          mkdir -p build install
-          cd build
-          cmake .. \
-            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
-            -DANDROID_ABI=arm64-v8a \
-            -DANDROID_PLATFORM=android-21 \
-            -DUNICORN_ARCH=aarch64 \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX=$(pwd)/../install   # 安装到项目根目录下的 install 文件夹
+          mkdir -p llvm-build
+          cd llvm-build
 
-      - name: Build and install
+          cmake ../llvm-project/llvm \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DLLVM_ENABLE_PROJECTS="clang;lld;clang-tools-extra" \
+            -DLLVM_TARGETS_TO_BUILD="AArch64" \
+            -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+            -DCMAKE_CROSSCOMPILING=ON \
+            -DLLVM_DEFAULT_TARGET_TRIPLE=aarch64-linux-android \
+            -DLLVM_HOST_TRIPLE=aarch64-linux-gnu \
+            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DLLVM_CCACHE_BUILD=ON \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
+            -DCLANG_ENABLE_ARCMT=OFF \
+            -DLLVM_ENABLE_ZSTD=OFF \
+            -DCMAKE_INSTALL_PREFIX=${{ runner.temp }}/llvm-install
+
+      - name: Build LLVM
         run: |
-          cmake --build build -j
-          cmake --install build --strip
+          cd llvm-build
+          ninja install -j$(nproc)
 
-      - name: Upload entire build directory and installed files
+      # -------------------- 5. 组装 NDK 包 --------------------
+      - name: Assemble aarch64 NDK
+        run: |
+          DEST="$RUNNER_TEMP/ndk-aarch64"
+          LLVM_INSTALL="$RUNNER_TEMP/llvm-install"
+          NDK_OFFICIAL="${{ env.NDK_OFFICIAL_PATH }}"
+
+          # 创建 NDK 根目录
+          mkdir -p "$DEST"
+
+          # ---- 1) 拷贝并调整 toolchains/llvm/prebuilt/linux-aarch64 ----
+          TOOLCHAIN_DIR="$DEST/toolchains/llvm/prebuilt/linux-aarch64"
+          mkdir -p "$TOOLCHAIN_DIR/bin"
+          mkdir -p "$TOOLCHAIN_DIR/lib64"
+
+          # 复制我们交叉编译出的 host 工具
+          cp -a "$LLVM_INSTALL/bin/"* "$TOOLCHAIN_DIR/bin/"
+          # 移除不需要的 Python 脚本等（可选）
+          rm -f "$TOOLCHAIN_DIR/bin/"*.py
+
+          # 复制 LLVM 库（clang 运行所需的共享库）
+          cp -a "$LLVM_INSTALL/lib/"*.so* "$TOOLCHAIN_DIR/lib64/" 2>/dev/null || true
+
+          # 从官方 NDK 中复制 sysroot、platforms、wrap 脚本等
+          OFFICIAL_TOOLCHAIN="$NDK_OFFICIAL/toolchains/llvm/prebuilt/linux-x86_64"
+
+          cp -a "$OFFICIAL_TOOLCHAIN/sysroot"        "$TOOLCHAIN_DIR/"
+          cp -a "$OFFICIAL_TOOLCHAIN/python3"        "$TOOLCHAIN_DIR/"
+          cp -a "$OFFICIAL_TOOLCHAIN/lib"            "$TOOLCHAIN_DIR/"
+          cp    "$OFFICIAL_TOOLCHAIN/"*.json         "$TOOLCHAIN_DIR/" 2>/dev/null || true
+          cp    "$OFFICIAL_TOOLCHAIN/"*.py           "$TOOLCHAIN_DIR/" 2>/dev/null || true
+
+          # 创建 clang 包装脚本，自动添加 sysroot
+          for tool in clang clang++ clang-21; do
+            if [ -f "$TOOLCHAIN_DIR/bin/$tool" ]; then
+              mv "$TOOLCHAIN_DIR/bin/$tool" "$TOOLCHAIN_DIR/bin/$tool.real"
+              printf '#!/bin/bash\nDIR="$(cd "$(dirname "$0")" && pwd)"\n' > "$TOOLCHAIN_DIR/bin/$tool"
+              echo 'exec "$DIR/'$tool.real'" --sysroot="$DIR/../sysroot" "$@"' >> "$TOOLCHAIN_DIR/bin/$tool"
+              chmod +x "$TOOLCHAIN_DIR/bin/$tool"
+            fi
+          done
+
+          # ---- 2) 其他 NDK 目录（platforms、sources 等）直接复制 ----
+          cp -a "$NDK_OFFICIAL/platforms" "$DEST/"
+          cp -a "$NDK_OFFICIAL/sources"  "$DEST/"
+          cp -a "$NDK_OFFICIAL/toolchains/llvm/prebuilt/linux-x86_64/AndroidVersion.txt" "$DEST/" 2>/dev/null || true
+          cp    "$NDK_OFFICIAL/ndk-build"    "$DEST/" 2>/dev/null || true
+          cp    "$NDK_OFFICIAL/ndk-gdb"     "$DEST/" 2>/dev/null || true
+          cp    "$NDK_OFFICIAL/ndk-stack"   "$DEST/" 2>/dev/null || true
+          cp    "$NDK_OFFICIAL/ndk-which"   "$DEST/" 2>/dev/null || true
+          cp    "$NDK_OFFICIAL/source.properties" "$DEST/" 2>/dev/null || true
+
+          # 清理 x86_64 工具链目录（已不需要）
+          rm -rf "$DEST/toolchains/llvm/prebuilt/linux-x86_64"
+
+          echo "NDK_AARCH64_DIR=$DEST" >> $GITHUB_ENV
+
+      # -------------------- 6. 打包并上传 artifact --------------------
+      - name: Package NDK
+        run: |
+          cd "${{ runner.temp }}"
+          tar -cJf ndk-aarch64-host.tar.xz ndk-aarch64
+          mv ndk-aarch64-host.tar.xz "${{ github.workspace }}/"
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: unicorn-android-aarch64-build-dir
-          path: |
-            build/
-            install/
+          name: ndk-aarch64-host-ndk29
+          path: ndk-aarch64-host.tar.xz
